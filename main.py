@@ -98,9 +98,6 @@ async def get_music(query: str):
         )
 
 
-# ─────────────────────────────
-# OPTIONAL: HEALTH CHECK
-# ─────────────────────────────
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def home():
     return {"status": "ok", "cache_items": len(MEM_CACHE)}
