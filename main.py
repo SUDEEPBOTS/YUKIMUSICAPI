@@ -1,7 +1,5 @@
-import os
-import subprocess
-import requests
-from fastapi import FastAPI, HTTPException
+import os, time, datetime, subprocess, requests
+from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
 from youtubesearchpython import VideosSearch
 
@@ -10,7 +8,7 @@ from youtubesearchpython import VideosSearch
 # ─────────────────────────────
 MONGO_URL = os.getenv("MONGO_DB_URI")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-LOG_GROUP_ID = os.getenv("LOG_GROUP_ID")
+ADMIN_CONTACT = "@Kaito_3_2"
 
 CATBOX_UPLOAD = "https://catbox.moe/user/api.php"
 COOKIES_PATH = "/app/cookies.txt"
@@ -22,17 +20,53 @@ app = FastAPI(title="Sudeep Music API ⚡ Video Auto")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client["MusicAPI_DB1"]
-collection = db["videos_cachet"]
+
+videos_col = db["videos_cachet"]
+keys_col = db["api_users"]
 
 MEM_CACHE = {}
 
 # ─────────────────────────────
+# API KEY VERIFY
+# ─────────────────────────────
+async def verify_api_key(key: str):
+    doc = await keys_col.find_one({"api_key": key, "active": True})
+    if not doc:
+        return False, "Invalid API key", None
+
+    now = int(time.time())
+    if now > doc["expires_at"]:
+        await send_dm(
+            doc["user_id"],
+            f"⚠️ Your API key has expired.\n\nContact {ADMIN_CONTACT} to renew."
+        )
+        return False, "API key expired", doc
+
+    today = str(datetime.date.today())
+    if doc.get("last_reset") != today:
+        await keys_col.update_one(
+            {"api_key": key},
+            {"$set": {"used_today": 0, "last_reset": today}}
+        )
+        doc["used_today"] = 0
+
+    if doc["used_today"] >= doc["daily_limit"]:
+        return False, "Daily limit exceeded", doc
+
+    await keys_col.update_one(
+        {"api_key": key},
+        {"$inc": {"used_today": 1}}
+    )
+
+    return True, None, doc
+
+# ─────────────────────────────
 # HELPERS
 # ─────────────────────────────
-def yt_url(video_id: str):
+def yt_url(video_id):
     return f"https://www.youtube.com/watch?v={video_id}"
 
-def extract_video_id(q: str):
+def extract_video_id(q):
     q = q.strip()
     if len(q) == 11 and " " not in q:
         return q
@@ -42,42 +76,27 @@ def extract_video_id(q: str):
         return q.split("youtu.be/")[1].split("?")[0]
     return None
 
-def search_youtube(query: str):
+def search_youtube(query):
     try:
-        search = VideosSearch(query, limit=1)
-        data = search.result()
-        if not data:
+        s = VideosSearch(query, limit=1)
+        r = s.result().get("result")
+        if not r:
             return None, None
-
-        res = data.get("result")
-        if not res:
-            return None, None
-
-        vid = res[0].get("id")
-        title = res[0].get("title")
-
-        if not vid:
-            return None, None
-
-        return vid, title
-
-    except Exception as e:
-        print("YT SEARCH ERROR:", e)
+        return r[0]["id"], r[0]["title"]
+    except:
         return None, None
 
-def send_logger(text: str):
-    if not BOT_TOKEN or not LOG_GROUP_ID:
-        return
+async def send_dm(user_id, text):
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": LOG_GROUP_ID, "text": text},
+            data={"chat_id": user_id, "text": text},
             timeout=10
         )
     except:
         pass
 
-def upload_catbox(path: str):
+def upload_catbox(path):
     with open(path, "rb") as f:
         r = requests.post(
             CATBOX_UPLOAD,
@@ -85,29 +104,22 @@ def upload_catbox(path: str):
             files={"fileToUpload": f},
             timeout=120
         )
-    if r.status_code == 200 and r.text.startswith("https://"):
+    if r.text.startswith("https://"):
         return r.text.strip()
     raise Exception("Catbox upload failed")
 
-def auto_download_video(video_id: str) -> str:
-    if not os.path.exists(COOKIES_PATH):
-        raise Exception("cookies.txt missing")
-
+def auto_download_video(video_id):
     out = f"/tmp/{video_id}.mp4"
-
     cmd = [
         "python", "-m", "yt_dlp",
         "--cookies", COOKIES_PATH,
         "--js-runtimes", "node",
         "--no-playlist",
-        "--geo-bypass",
-        "--force-ipv4",
         "-f", "bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         yt_url(video_id),
         "-o", out
     ]
-
     subprocess.run(cmd, check=True, timeout=900)
     return out
 
@@ -115,27 +127,27 @@ def auto_download_video(video_id: str) -> str:
 # MAIN VIDEO API
 # ─────────────────────────────
 @app.get("/getvideo")
-async def get_video(query: str):
+async def get_video(query: str, key: str = None):
+
+    if not key:
+        return {"status": 401, "error": "API key required"}
+
+    ok, err, _ = await verify_api_key(key)
+    if not ok:
+        return {"status": 403, "error": err}
+
     video_id = extract_video_id(query)
     title = None
 
-    # 🔎 Name search
     if not video_id:
         video_id, title = search_youtube(query)
         if not video_id:
-            return {
-                "status": 404,
-                "title": None,
-                "link": None,
-                "video_id": None
-            }
+            return {"status": 404, "title": None, "link": None, "video_id": None}
 
-    # ⚡ RAM cache
     if video_id in MEM_CACHE:
         return MEM_CACHE[video_id]
 
-    # 💾 DB cache
-    cached = await collection.find_one({"video_id": video_id}, {"_id": 0})
+    cached = await videos_col.find_one({"video_id": video_id})
     if cached:
         resp = {
             "status": 200,
@@ -146,60 +158,31 @@ async def get_video(query: str):
         MEM_CACHE[video_id] = resp
         return resp
 
-    # ⬇️ Auto download
-    try:
-        file_path = auto_download_video(video_id)
-        catbox = upload_catbox(file_path)
+    file_path = auto_download_video(video_id)
+    catbox = upload_catbox(file_path)
 
-        try:
-            os.remove(file_path)
-        except:
-            pass
-
-        if not title:
-            title = video_id
-
-        await collection.update_one(
-            {"video_id": video_id},
-            {"$set": {
-                "video_id": video_id,
-                "title": title,
-                "catbox_link": catbox
-            }},
-            upsert=True
-        )
-
-        resp = {
-            "status": 200,
-            "title": title,
-            "link": catbox,
-            "video_id": video_id
-        }
-        MEM_CACHE[video_id] = resp
-
-        send_logger(
-            f"🎥 New Video Added\n\n"
-            f"🆔 {video_id}\n"
-            f"🔗 {catbox}"
-        )
-
-        return resp
-
-    except Exception as e:
-        return {
-            "status": 500,
-            "title": None,
-            "link": None,
+    await videos_col.update_one(
+        {"video_id": video_id},
+        {"$set": {
             "video_id": video_id,
-            "error": str(e)
-        }
+            "title": title or video_id,
+            "catbox_link": catbox
+        }},
+        upsert=True
+    )
+
+    resp = {
+        "status": 200,
+        "title": title or video_id,
+        "link": catbox,
+        "video_id": video_id
+    }
+    MEM_CACHE[video_id] = resp
+    return resp
 
 # ─────────────────────────────
 # HEALTH
 # ─────────────────────────────
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.get("/")
 async def home():
-    return {
-        "status": 200,
-        "cache": len(MEM_CACHE)
-    }
+    return {"status": 200}
