@@ -43,11 +43,27 @@ def extract_video_id(q: str):
     return None
 
 def search_youtube(query: str):
-    search = VideosSearch(query, limit=1)
-    res = search.result().get("result")
-    if not res:
+    try:
+        search = VideosSearch(query, limit=1)
+        data = search.result()
+        if not data:
+            return None, None
+
+        res = data.get("result")
+        if not res:
+            return None, None
+
+        vid = res[0].get("id")
+        title = res[0].get("title")
+
+        if not vid:
+            return None, None
+
+        return vid, title
+
+    except Exception as e:
+        print("YT SEARCH ERROR:", e)
         return None, None
-    return res[0]["id"], res[0]["title"]
 
 def send_logger(text: str):
     if not BOT_TOKEN or not LOG_GROUP_ID:
@@ -100,31 +116,37 @@ def auto_download_video(video_id: str) -> str:
 # ─────────────────────────────
 @app.get("/getvideo")
 async def get_video(query: str):
-    # 1️⃣ extract or search
     video_id = extract_video_id(query)
     title = None
 
+    # 🔎 Name search
     if not video_id:
         video_id, title = search_youtube(query)
         if not video_id:
-            raise HTTPException(404, "No video found")
+            return {
+                "status": 404,
+                "title": None,
+                "link": None,
+                "video_id": None
+            }
 
-    # 2️⃣ RAM cache
+    # ⚡ RAM cache
     if video_id in MEM_CACHE:
         return MEM_CACHE[video_id]
 
-    # 3️⃣ DB cache
+    # 💾 DB cache
     cached = await collection.find_one({"video_id": video_id}, {"_id": 0})
     if cached:
         resp = {
-            "t": cached["title"],
-            "u": cached["catbox_link"],
-            "id": video_id
+            "status": 200,
+            "title": cached["title"],
+            "link": cached["catbox_link"],
+            "video_id": video_id
         }
         MEM_CACHE[video_id] = resp
         return resp
 
-    # 4️⃣ Auto download
+    # ⬇️ Auto download
     try:
         file_path = auto_download_video(video_id)
         catbox = upload_catbox(file_path)
@@ -137,22 +159,21 @@ async def get_video(query: str):
         if not title:
             title = video_id
 
-        doc = {
-            "video_id": video_id,
-            "title": title,
-            "catbox_link": catbox
-        }
-
         await collection.update_one(
             {"video_id": video_id},
-            {"$set": doc},
+            {"$set": {
+                "video_id": video_id,
+                "title": title,
+                "catbox_link": catbox
+            }},
             upsert=True
         )
 
         resp = {
-            "t": title,
-            "u": catbox,
-            "id": video_id
+            "status": 200,
+            "title": title,
+            "link": catbox,
+            "video_id": video_id
         }
         MEM_CACHE[video_id] = resp
 
@@ -165,11 +186,20 @@ async def get_video(query: str):
         return resp
 
     except Exception as e:
-        raise HTTPException(500, str(e))
+        return {
+            "status": 500,
+            "title": None,
+            "link": None,
+            "video_id": video_id,
+            "error": str(e)
+        }
 
 # ─────────────────────────────
 # HEALTH
 # ─────────────────────────────
 @app.api_route("/", methods=["GET", "HEAD"])
 async def home():
-    return {"status": "ok", "cache": len(MEM_CACHE)}
+    return {
+        "status": 200,
+        "cache": len(MEM_CACHE)
+    }
