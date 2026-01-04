@@ -1,29 +1,29 @@
 import os
-import uuid
 import subprocess
 import requests
 from fastapi import FastAPI, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # ─────────────────────────────
-# CONFIG
+# ENV CONFIG
 # ─────────────────────────────
 MONGO_URL = os.getenv("MONGO_DB_URI")
-BOT_TOKEN = os.getenv("BOT_TOKEN")          # logger ke liye
-LOG_GROUP_ID = os.getenv("LOG_GROUP_ID")    # logger GC id (e.g. -100xxxx)
+BOT_TOKEN = os.getenv("BOT_TOKEN")          # Telegram logger bot token
+LOG_GROUP_ID = os.getenv("LOG_GROUP_ID")    # Logger GC ID (-100xxxx)
 
 CATBOX_UPLOAD = "https://catbox.moe/user/api.php"
-COOKIES_PATH = "/app/cookies.txt"           # ROOT cookies.txt
+COOKIES_PATH = "/app/cookies.txt"           # cookies.txt ROOT me
 
 # ─────────────────────────────
 # APP
 # ─────────────────────────────
-app = FastAPI(title="Sudeep Music API ⚡ Auto Fetch")
+app = FastAPI(title="Sudeep Music API ⚡ Auto Download")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client["MusicAPI_DB1"]
 collection = db["songs_cachee"]
 
+# Ultra-fast RAM cache
 MEM_CACHE = {}
 
 # ─────────────────────────────
@@ -32,13 +32,24 @@ MEM_CACHE = {}
 def yt_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
+def extract_video_id(query: str):
+    q = query.strip()
+    if len(q) == 11 and " " not in q:
+        return q
+    if "v=" in q:
+        return q.split("v=")[1].split("&")[0]
+    if "youtu.be/" in q:
+        return q.split("youtu.be/")[1].split("?")[0]
+    return None
+
 def send_logger(text: str):
     if not BOT_TOKEN or not LOG_GROUP_ID:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": LOG_GROUP_ID, "text": text}
+            data={"chat_id": LOG_GROUP_ID, "text": text},
+            timeout=10
         )
     except:
         pass
@@ -55,33 +66,24 @@ def upload_catbox(file_path: str) -> str:
         return r.text.strip()
     raise Exception("Catbox upload failed")
 
-def extract_video_id(query: str):
-    q = query.strip()
-    if len(q) == 11 and " " not in q:
-        return q
-    if "v=" in q:
-        return q.split("v=")[1].split("&")[0]
-    if "youtu.be/" in q:
-        return q.split("youtu.be/")[1].split("?")[0]
-    return None
-
 def auto_download(video_id: str) -> str:
     """
-    yt-dlp + ffmpeg via yt-dlp
-    output: /tmp/<id>.mp3
+    yt-dlp + ffmpeg
+    Output: /tmp/<video_id>.mp3
     """
     out = f"/tmp/{video_id}.mp3"
     cmd = [
-    "python", "-m", "yt_dlp",
-    "--cookies", COOKIES_PATH,
-    "-f", "bestaudio",
-    "--extract-audio",
-    "--audio-format", "mp3",
-    "--audio-quality", "0",
-    yt_url(video_id),
-    "-o", out
+        "python", "-m", "yt_dlp",
+        "--cookies", COOKIES_PATH,
+        "-f", "bestaudio",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        yt_url(video_id),
+        "-o", out
     ]
-    subprocess.run(cmd, check=True)
+    # ⛑ timeout added to avoid freeze
+    subprocess.run(cmd, check=True, timeout=300)
     return out
 
 # ─────────────────────────────
@@ -91,37 +93,57 @@ def auto_download(video_id: str) -> str:
 async def get_music(query: str):
     video_id = extract_video_id(query)
     if not video_id:
-        raise HTTPException(400, "Invalid query / video id")
+        raise HTTPException(400, "Invalid YouTube video id")
 
-    # 1️⃣ RAM cache
+    # 1️⃣ RAM CACHE (FASTEST)
     if video_id in MEM_CACHE:
         return MEM_CACHE[video_id]
 
-    # 2️⃣ DB cache
+    # 2️⃣ DB CACHE
     cached = await collection.find_one({"video_id": video_id}, {"_id": 0})
     if cached:
-        resp = {"t": cached["title"], "u": cached["catbox_link"], "id": video_id}
+        resp = {
+            "t": cached["title"],
+            "u": cached["catbox_link"],
+            "id": video_id
+        }
         MEM_CACHE[video_id] = resp
         return resp
 
-    # 3️⃣ AUTO DOWNLOAD
+    # 3️⃣ AUTO DOWNLOAD (yt-dlp → Catbox)
     try:
         local_file = auto_download(video_id)
         catbox_link = upload_catbox(local_file)
 
-        title = video_id  # simple; bot side se YouTube title aa jaayega
+        # cleanup temp file
+        try:
+            os.remove(local_file)
+        except:
+            pass
+
         doc = {
             "video_id": video_id,
-            "title": title,
+            "title": video_id,   # bot side se proper title aa jaata hai
             "catbox_link": catbox_link
         }
-        await collection.insert_one(doc)
 
-        resp = {"t": title, "u": catbox_link, "id": video_id}
+        # ⛑ safe upsert (duplicate crash nahi hoga)
+        await collection.update_one(
+            {"video_id": video_id},
+            {"$set": doc},
+            upsert=True
+        )
+
+        resp = {
+            "t": video_id,
+            "u": catbox_link,
+            "id": video_id
+        }
         MEM_CACHE[video_id] = resp
 
+        # Telegram logger
         send_logger(
-            f"🎵 New Song Added Automatically\n"
+            f"🎵 New Song Added Automatically\n\n"
             f"🆔 {video_id}\n"
             f"📦 Catbox\n"
             f"🔗 {catbox_link}"
@@ -133,8 +155,11 @@ async def get_music(query: str):
         raise HTTPException(500, f"Auto download failed: {e}")
 
 # ─────────────────────────────
-# HEALTH (UPTIME)
+# HEALTH / UPTIME
 # ─────────────────────────────
 @app.api_route("/", methods=["GET", "HEAD"])
 async def home():
-    return {"status": "ok", "cache_items": len(MEM_CACHE)}
+    return {
+        "status": "ok",
+        "cache_items": len(MEM_CACHE)
+    }
