@@ -52,7 +52,7 @@ keys_col = db["api_users"]
 RAM_CACHE = {}
 
 # ─────────────────────────────
-# CORE FUNCTIONS - WITH COOKIES SUPPORT
+# CORE FUNCTIONS
 # ─────────────────────────────
 def extract_video_id(q: str):
     """Extract video ID from any input"""
@@ -102,7 +102,6 @@ def quick_search(query: str):
         # Add cookies if available
         if COOKIES_PATH and os.path.exists(COOKIES_PATH):
             ydl_opts['cookiefile'] = COOKIES_PATH
-            print("🍪 Using cookies for search")
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"ytsearch1:{query}", download=False)
@@ -179,19 +178,34 @@ async def verify_key_fast(key: str):
     except Exception as e:
         return False, f"Verification error: {str(e)}"
 
+# ─────────────────────────────
+# 🔥 UPDATED DOWNLOAD FUNCTION (FIXES CORRUPTION)
+# ─────────────────────────────
 def download_video_with_cookies(video_id: str):
-    """Download with proper cookies support"""
+    """Download with FFmpeg merge to fix corrupted videos"""
     try:
         out_file = f"/tmp/{video_id}.mp4"
         
-        # Base command
+        # Clean existing file
+        if os.path.exists(out_file):
+            os.remove(out_file)
+        
+        # Command setup with FFmpeg merge and Recode
         cmd = [
             "yt-dlp",
-            "-f", "best[height<=480]",
+            # Try to get Best Video (MP4) + Best Audio (M4A) OR fallback to Best Single
+            "-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]",
+            
+            # Force merge into MP4 container
             "--merge-output-format", "mp4",
+            
+            # Ensure codec is compatible (Fixes 'unsupported format' on phones)
+            "--recode-video", "mp4",
+            
             "--no-playlist",
             "--socket-timeout", "30",
-            "--retries", "3",
+            
+            # Output file
             "-o", out_file,
             f"https://www.youtube.com/watch?v={video_id}"
         ]
@@ -203,25 +217,33 @@ def download_video_with_cookies(video_id: str):
         
         print(f"Running command: {' '.join(cmd)}")
         
+        # Run download (Increased timeout to 10 mins for merging)
         result = subprocess.run(
             cmd, 
             capture_output=True, 
             text=True, 
-            timeout=300
+            timeout=600
         )
         
         if result.returncode != 0:
-            print(f"Download error: {result.stderr}")
-            
-            # Try without cookies if cookies failed
-            if COOKIES_PATH in cmd:
-                print("🔄 Trying without cookies...")
-                cmd.remove("--cookies")
-                cmd.remove(COOKIES_PATH)
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            print(f"❌ Download error: {result.stderr}")
+            # Fallback for tough videos (Single file only)
+            print("🔄 Retrying with fallback mode...")
+            fallback_cmd = [
+                "yt-dlp",
+                "-f", "best[height<=480]",
+                "-o", out_file,
+                f"https://www.youtube.com/watch?v={video_id}"
+            ]
+            subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=300)
         
+        # Verify file
         if os.path.exists(out_file):
             file_size = os.path.getsize(out_file)
+            if file_size < 1024: # Less than 1KB = Corrupted
+                print("❌ File too small (Corrupted)")
+                return None
+            
             print(f"✅ Downloaded: {out_file} ({file_size} bytes)")
             return out_file
         else:
@@ -236,25 +258,23 @@ def download_video_with_cookies(video_id: str):
         return None
 
 def upload_to_catbox(file_path: str):
-    """Upload to catbox - FIXED VERSION"""
+    """Upload to catbox with reqtype fix"""
     try:
         print(f"📤 Uploading: {file_path}")
         
         with open(file_path, "rb") as f:
-            # ✅ 关键修复：确保包含 reqtype 参数
             response = requests.post(
                 CATBOX_UPLOAD,
-                data={"reqtype": "fileupload"},  # 必须添加这一行
+                data={"reqtype": "fileupload"},
                 files={"fileToUpload": f},
                 timeout=120
             )
         
-        print(f"Upload response: {response.status_code} - {response.text[:100]}")
-        
         if response.status_code == 200 and response.text.startswith("http"):
+            print(f"✅ Upload success: {response.text.strip()}")
             return response.text.strip()
         else:
-            print(f"Upload failed: {response.text}")
+            print(f"❌ Upload failed: {response.text}")
             return None
             
     except Exception as e:
@@ -262,35 +282,35 @@ def upload_to_catbox(file_path: str):
         return None
 
 async def background_download(video_id: str, title: str, duration: str):
-    """Process video in background"""
+    """Process video in background with Size Fix"""
     try:
         print(f"🔄 Starting background download for: {video_id}")
         
-        # Download
+        # 1. Download
         file_path = download_video_with_cookies(video_id)
         if not file_path:
-            print(f"❌ Download failed for {video_id}")
             return
         
-        # Upload
+        # Get Size BEFORE upload/delete
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        
+        # 2. Upload
         catbox_url = upload_to_catbox(file_path)
         if not catbox_url:
-            print(f"❌ Upload failed for {video_id}")
-            # Clean up
             try:
                 os.remove(file_path)
             except:
                 pass
             return
         
-        # Clean up
+        # 3. Clean up
         try:
             os.remove(file_path)
             print(f"🧹 Cleaned up temp file")
         except:
             pass
         
-        # Save to DB
+        # 4. Save to DB
         await videos_col.update_one(
             {"video_id": video_id},
             {"$set": {
@@ -299,12 +319,12 @@ async def background_download(video_id: str, title: str, duration: str):
                 "duration": duration,
                 "catbox_link": catbox_url,
                 "cached_at": datetime.datetime.now(),
-                "size_mb": os.path.getsize(file_path) / (1024*1024) if os.path.exists(file_path) else 0
+                "size_mb": file_size_mb
             }},
             upsert=True
         )
         
-        # Update RAM cache
+        # 5. Update RAM cache
         RAM_CACHE[video_id] = {
             "status": 200,
             "title": title,
@@ -314,7 +334,7 @@ async def background_download(video_id: str, title: str, duration: str):
             "cached": True
         }
         
-        print(f"✅ Successfully processed: {video_id}")
+        print(f"✅ COMPLETED: {title}")
         
     except Exception as e:
         print(f"❌ Background process error: {e}")
@@ -502,3 +522,4 @@ async def startup_tasks():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    
