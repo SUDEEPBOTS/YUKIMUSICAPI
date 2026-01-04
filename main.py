@@ -5,7 +5,7 @@ import subprocess
 import requests
 from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
-from youtubesearchpython import VideosSearch # ✅ FIX
+from youtubesearchpython import VideosSearch
 
 # ─────────────────────────────
 # ENV CONFIG
@@ -63,7 +63,6 @@ async def verify_api_key(key: str):
             {"api_key": key},
             {"$set": {"used_today": 0, "last_reset": today}}
         )
-        doc["used_today"] = 0
 
     if doc["used_today"] >= doc["daily_limit"]:
         return False, "Daily limit exceeded"
@@ -91,7 +90,7 @@ def extract_video_id(q: str):
         return q.split("youtu.be/")[1].split("?")[0]
     return None
 
-# ✅ FIXED ASYNC SEARCH
+# ✅ SYNC SEARCH (NO await)
 def search_youtube(query: str):
     try:
         search = VideosSearch(query, limit=1)
@@ -101,7 +100,6 @@ def search_youtube(query: str):
             return None
 
         video = result[0]
-
         return {
             "id": video["id"],
             "title": video["title"],
@@ -133,7 +131,6 @@ def auto_download_video(video_id: str) -> str:
     cmd = [
         "python", "-m", "yt_dlp",
         "--cookies", COOKIES_PATH,
-        "--js-runtimes", "node",
         "--no-playlist",
         "--geo-bypass",
         "--force-ipv4",
@@ -165,7 +162,7 @@ async def get_video(query: str, key: str | None = None):
 
     # 🔎 SEARCH
     if not video_id:
-        data = await search_youtube(query)
+        data = search_youtube(query)   # ✅ NO await
         if not data:
             return {
                 "status": 404,
@@ -174,11 +171,12 @@ async def get_video(query: str, key: str | None = None):
                 "link": None,
                 "video_id": None
             }
+
         video_id = data["id"]
         title = data["title"]
         duration = data["duration"]
     else:
-        data = await search_youtube(video_id)
+        data = search_youtube(video_id)
         if data:
             title = data["title"]
             duration = data["duration"]
