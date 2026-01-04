@@ -177,6 +177,7 @@ async def get_video(query: str, key: str):
             "title": cached["title"],
             "duration": cached["duration"],
             "link": cached["catbox_link"],
+            "id": video_id,  # <--- YE LINE JOD DE
             "cached": True,
             "response_time": f"{time.time()-start_time:.2f}s"
         }
