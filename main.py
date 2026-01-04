@@ -5,17 +5,17 @@ import subprocess
 import requests
 from fastapi import FastAPI
 from motor.motor_asyncio import AsyncIOMotorClient
-from youtubesearchpython import VideosSearch
+from youtubesearchpython.__future__ import VideosSearch  # ✅ FIX
 
 # ─────────────────────────────
 # ENV CONFIG
 # ─────────────────────────────
 MONGO_URL = os.getenv("MONGO_DB_URI")
-BOT_TOKEN = os.getenv("BOT_TOKEN")          # DM notify ke liye
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CONTACT = "@Kaito_3_2"
 
 CATBOX_UPLOAD = "https://catbox.moe/user/api.php"
-COOKIES_PATH = "/app/cookies.txt"           # Docker / Render path
+COOKIES_PATH = "/app/cookies.txt"
 
 # ─────────────────────────────
 # APP INIT
@@ -28,7 +28,6 @@ db = mongo["MusicAPI_DB1"]
 videos_col = db["videos_cachet"]
 keys_col = db["api_users"]
 
-# RAM Cache
 MEM_CACHE = {}
 
 # ─────────────────────────────
@@ -92,22 +91,23 @@ def extract_video_id(q: str):
         return q.split("youtu.be/")[1].split("?")[0]
     return None
 
-def search_youtube(query: str):
-    """
-    Returns: {id, title, duration}
-    """
+# ✅ FIXED ASYNC SEARCH
+async def search_youtube(query: str):
     try:
-        s = VideosSearch(query, limit=1)
-        r = s.result().get("result")
-        if not r:
+        search = VideosSearch(query, limit=1)
+        result = await search.next()
+        videos = result.get("result")
+        if not videos:
             return None
 
+        v = videos[0]
         return {
-            "id": r[0]["id"],
-            "title": r[0]["title"],
-            "duration": r[0]["duration"] or "unknown"
+            "id": v["id"],
+            "title": v["title"],
+            "duration": v.get("duration") or "unknown"
         }
-    except:
+    except Exception as e:
+        print("YT SEARCH ERROR:", e)
         return None
 
 def upload_catbox(path: str) -> str:
@@ -161,9 +161,9 @@ async def get_video(query: str, key: str | None = None):
     title = None
     duration = None
 
-    # 🔎 Search if needed
+    # 🔎 SEARCH
     if not video_id:
-        data = search_youtube(query)
+        data = await search_youtube(query)
         if not data:
             return {
                 "status": 404,
@@ -172,21 +172,20 @@ async def get_video(query: str, key: str | None = None):
                 "link": None,
                 "video_id": None
             }
-
         video_id = data["id"]
         title = data["title"]
         duration = data["duration"]
     else:
-        data = search_youtube(video_id)
+        data = await search_youtube(video_id)
         if data:
             title = data["title"]
             duration = data["duration"]
 
-    # ⚡ RAM Cache
+    # ⚡ RAM CACHE
     if video_id in MEM_CACHE:
         return MEM_CACHE[video_id]
 
-    # 💾 DB Cache
+    # 💾 DB CACHE
     cached = await videos_col.find_one({"video_id": video_id})
     if cached:
         resp = {
@@ -199,7 +198,7 @@ async def get_video(query: str, key: str | None = None):
         MEM_CACHE[video_id] = resp
         return resp
 
-    # ⬇️ Download → Catbox
+    # ⬇️ DOWNLOAD → CATBOX
     try:
         file_path = auto_download_video(video_id)
         catbox = upload_catbox(file_path)
@@ -242,7 +241,7 @@ async def get_video(query: str, key: str | None = None):
         }
 
 # ─────────────────────────────
-# HEALTH CHECK
+# HEALTH
 # ─────────────────────────────
 @app.api_route("/", methods=["GET", "HEAD"])
 async def home():
