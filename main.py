@@ -60,7 +60,7 @@ def format_time(seconds):
 def get_video_id_only(query: str):
     ydl_opts = {'quiet': True, 'skip_download': True, 'extract_flat': True, 'noplaylist': True}
     if COOKIES_PATH: ydl_opts['cookiefile'] = COOKIES_PATH
-    
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Case A: Direct ID/URL
@@ -68,7 +68,7 @@ def get_video_id_only(query: str):
             if direct_id:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={direct_id}", download=False)
                 return direct_id, info.get('title'), format_time(info.get('duration')), info.get('thumbnail')
-            
+
             # Case B: Search Query
             else:
                 info = ydl.extract_info(f"ytsearch1:{query}", download=False)
@@ -112,7 +112,7 @@ def auto_download_video(video_id: str):
 # ─────────────────────────────
 async def verify_and_count(key: str):
     doc = await keys_col.find_one({"api_key": key})
-    
+
     if not doc or not doc.get("active", True):
         return False, "Invalid/Inactive Key"
 
@@ -129,7 +129,7 @@ async def verify_and_count(key: str):
     if doc.get("used_today", 0) >= doc.get("daily_limit", 100):
         return False, "Daily Limit Exceeded"
 
-    # ✅ INCREMENT USAGE (Yeh zaroori tha Admin Bot ke liye)
+    # ✅ INCREMENT USAGE
     await keys_col.update_one(
         {"api_key": key},
         {
@@ -166,8 +166,11 @@ async def user_stats(target_key: str):
         "last_active": doc.get("last_reset")
     }
 
-@app.get("/")
-def home():
+# ─────────────────────────────
+# 🔥 UPTIME ENDPOINT (FIXED: Supports HEAD & GET)
+# ─────────────────────────────
+@app.api_route("/", methods=["GET", "HEAD"])
+async def home():
     return {"status": "Running", "mode": "Ultimate Version"}
 
 # ─────────────────────────────
@@ -176,17 +179,17 @@ def home():
 @app.get("/getvideo")
 async def get_video(query: str, key: str):
     start_time = time.time()
-    
+
     # 1. Auth Check
     is_valid, err = await verify_and_count(key)
     if not is_valid: return {"status": 403, "error": err}
 
     clean_query = query.strip().lower()
-    
+
     # PART A: IDENTIFY VIDEO
     video_id = None
     cached_q = await queries_col.find_one({"query": clean_query})
-    
+
     title = "Unknown"
     duration = "0:00"
     thumbnail = None
@@ -200,12 +203,12 @@ async def get_video(query: str, key: str):
             duration = meta.get("duration", "0:00")
             thumbnail = meta.get("thumbnail") # Fetch Thumbnail
         print(f"🧠 Memory Match: {clean_query} -> {video_id}")
-    
+
     # Search if not in memory
     if not video_id:
         print(f"🔍 Searching YouTube for: {query}")
         video_id, title, duration, thumbnail = await asyncio.to_thread(get_video_id_only, query)
-        
+
         if video_id:
              await queries_col.update_one({"query": clean_query}, {"$set": {"video_id": video_id}}, upsert=True)
 
@@ -213,7 +216,7 @@ async def get_video(query: str, key: str):
 
     # PART B: CHECK DATABASE
     cached = await videos_col.find_one({"video_id": video_id})
-    
+
     if cached and cached.get("catbox_link"):
         print(f"✅ Found in DB: {title}")
         return {
@@ -229,7 +232,7 @@ async def get_video(query: str, key: str):
 
     # PART C: DOWNLOAD & SAVE
     print(f"⏳ Downloading: {title}")
-    
+
     # Save Metadata + Thumbnail immediately
     await videos_col.update_one(
         {"video_id": video_id}, 
@@ -269,4 +272,3 @@ async def get_video(query: str, key: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    
